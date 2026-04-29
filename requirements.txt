@@ -3,3 +3,4 @@ uvicorn
 python-multipart
 python-dotenv
 groq
+scikit-learn==1.3.2
