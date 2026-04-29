@@ -1,6 +1,7 @@
 fastapi
 uvicorn
-python-multipart
+pandas
+joblib
+scikit-learn==1.3.2
 python-dotenv
 groq
-scikit-learn==1.3.2
