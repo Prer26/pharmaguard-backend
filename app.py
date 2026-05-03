@@ -1,21 +1,26 @@
-from fastapi import FastAPI
+from fastapi import FastAPI, UploadFile, File, Form
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 import joblib
 import pandas as pd
 import os
-from groq import Groq
 from dotenv import load_dotenv
+from groq import Groq
 import json, re
 
-# 🔐 Load env
+# ============================
+# 🔐 ENV SETUP
+# ============================
 load_dotenv()
+groq_api_key = os.getenv("GROQ_API_KEY")
 
-client = Groq(api_key=os.getenv("GROQ_API_KEY"))
+client = Groq(api_key=groq_api_key) if groq_api_key else None
 
 app = FastAPI()
 
+# ============================
 # 🌐 CORS
+# ============================
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -24,14 +29,98 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# 📦 Load model
-model = joblib.load("models/pharmaguard_model.pkl")
-encoders = joblib.load("models/encoders.pkl")
-target_encoder = joblib.load("models/target_encoder.pkl")
+# ============================
+# 🧪 LOAD ML MODEL (SAFE)
+# ============================
+try:
+    model = joblib.load("models/pharmaguard_model.pkl")
+    encoders = joblib.load("models/encoders.pkl")
+    target_encoder = joblib.load("models/target_encoder.pkl")
+    print("✅ ML model loaded")
+except Exception as e:
+    print("❌ Model load failed:", e)
+    model = None
+    encoders = None
+    target_encoder = None
 
-# =====================================
-# 🧾 REQUEST MODEL (FIXES SWAGGER)
-# =====================================
+# ============================
+# 🏠 ROOT
+# ============================
+@app.get("/")
+def home():
+    return {"message": "PharmaGuard backend running 🚀"}
+
+# ============================
+# 🔬 CLINICAL ANALYSIS
+# ============================
+@app.post("/analyze")
+async def analyze(
+    file: UploadFile = File(None),
+    drug: str = Form(...),
+    gene: str = Form(None),
+    variant: str = Form(None)
+):
+    try:
+        drugs = [d.strip().upper() for d in drug.split(",")]
+
+        detected_gene = "N/A"
+        detected_variant = "N/A"
+
+        # 📂 FILE MODE
+        if file:
+            content = await file.read()
+
+            # (Mock parsing for now)
+            detected_gene = "CYP2C9"
+            detected_variant = "*3"
+
+        # ✍️ MANUAL MODE
+        elif gene and variant:
+            detected_gene = gene.upper()
+            detected_variant = variant
+
+        else:
+            return {"error": "Provide VCF file OR gene+variant"}
+
+        # 🧠 BASIC LOGIC
+        risk_label = "Safe"
+        confidence = 0.85
+
+        if "WARFARIN" in drugs and detected_gene == "CYP2C9":
+            risk_label = "Adjust Dosage"
+            confidence = 0.78
+
+        return {
+            "risk_assessment": {
+                "risk_label": risk_label,
+                "confidence_score": confidence
+            },
+            "pharmacogenomic_profile": {
+                "primary_gene": detected_gene,
+                "phenotype": "Intermediate Metabolizer",
+                "diplotype": f"{detected_variant}/{detected_variant}",
+                "variants": [detected_variant],
+                "metabolism_status": "Reduced"
+            },
+            "clinical_recommendation": {
+                "guideline": "CPIC Guideline available",
+                "action": "Reduce dosage and monitor"
+            },
+            "llm_generated_explanation": {
+                "summary": "Genetic variation affects drug metabolism.",
+                "mechanism": "Enzyme activity reduced due to variant.",
+                "clinical_impact": "Higher drug levels may increase toxicity risk.",
+                "recommendation": "Adjust dose and monitor closely."
+            }
+        }
+
+    except Exception as e:
+        print("❌ ERROR in /analyze:", e)
+        return {"error": str(e)}
+
+# ============================
+# ⚡ QUICK RISK (ML)
+# ============================
 class RiskRequest(BaseModel):
     age: int
     gender: str
@@ -40,70 +129,39 @@ class RiskRequest(BaseModel):
     drug: str
     past_reaction: str
 
-
-# =====================================
-# 🧠 DRUG MAP (ONLY TRAINED DRUGS)
-# =====================================
-drug_map = {
-    "warfarin": "warfarin",
-    "clopidogrel": "clopidogrel",
-    "codeine": "codeine",
-    "omeprazole": "omeprazole",
-    "tamoxifen": "tamoxifen",
-    "phenytoin": "phenytoin",
-    "simvastatin": "simvastatin",
-    "abacavir": "abacavir",
-    "carbamazepine": "carbamazepine",
-    "allopurinol": "allopurinol"
-}
-
-
-@app.get("/")
-def home():
-    return {"message": "PharmaGuard AI running 🚀"}
-
-
-# =====================================
-# ⚡ QUICK RISK (ML + GROQ)
-# =====================================
 @app.post("/predict")
 def predict(data: RiskRequest):
     try:
-        # Normalize
+        if model is None or encoders is None or target_encoder is None:
+            return {"error": "ML model not loaded"}
+
         input_data = data.dict()
-        input_data["drug"] = input_data["drug"].strip().lower()
-        input_data["condition"] = input_data["condition"].strip().lower()
-        input_data["past_reaction"] = input_data["past_reaction"].strip().lower()
 
-        # Map drug
-        input_drug = input_data["drug"]
+        # 🔧 NORMALIZE
+        input_data["gender"] = input_data["gender"].upper()
+        input_data["ethnicity"] = input_data["ethnicity"].capitalize()
+        input_data["condition"] = input_data["condition"].lower()
+        input_data["drug"] = input_data["drug"].lower()
+        input_data["past_reaction"] = input_data["past_reaction"].lower()
 
-        if input_drug in drug_map:
-            mapped_drug = drug_map[input_drug]
-        elif input_drug in encoders["drug"].classes_:
-            mapped_drug = input_drug
-        else:
-            mapped_drug = encoders["drug"].classes_[0]
-
-        input_data["drug"] = mapped_drug
-
-        # Safe condition
-        if input_data["condition"] not in encoders["condition"].classes_:
-            input_data["condition"] = encoders["condition"].classes_[0]
+        # 🛡️ SAFE ENCODING
+        for col in ['gender', 'ethnicity', 'condition', 'drug', 'past_reaction']:
+            if input_data[col] not in encoders[col].classes_:
+                input_data[col] = encoders[col].classes_[0]
 
         df = pd.DataFrame([input_data])
 
-        # Encode
         for col in ['gender', 'ethnicity', 'condition', 'drug', 'past_reaction']:
             df[col] = encoders[col].transform(df[col])
 
-        # Predict
+        # 🤖 PREDICT
         pred = model.predict(df)
         proba = model.predict_proba(df)
 
-        risk = target_encoder.inverse_transform(pred)[0]
+        risk = target_encoder.inverse_transform(pred)[0].lower()
         confidence = float(max(proba[0]))
 
+        # 🎯 CONFIDENCE LABEL
         if confidence < 0.4:
             confidence_label = "Low confidence"
         elif confidence < 0.7:
@@ -111,23 +169,60 @@ def predict(data: RiskRequest):
         else:
             confidence_label = "High confidence"
 
-        # =====================================
-        # 🧠 GROQ EXPLANATION
-        # =====================================
+        return {
+            "risk": risk,
+            "confidence": round(confidence, 2),
+            "confidence_label": confidence_label,
+
+            "risk_summary": f"The model predicts a {risk} risk level for this drug.",
+            
+            "key_factors": [
+                f"Age: {input_data['age']}",
+                f"Condition: {input_data['condition']}",
+                f"Drug: {input_data['drug']}",
+                f"Past reaction: {input_data['past_reaction']}"
+            ],
+
+            "what_it_means": (
+                "This risk level indicates likelihood of adverse effects "
+                "or reduced drug effectiveness."
+            ),
+
+            "next_steps": (
+                "Consult a healthcare professional before taking this medication."
+            )
+        }
+
+    except Exception as e:
+        print("❌ ERROR in /predict:", e)
+        return {"error": str(e)}
+
+# ============================
+# 🧠 AI INTELLIGENCE
+# ============================
+@app.post("/ai-insights")
+def ai_insights(data: dict):
+    try:
+        drug = data.get("drug", "Unknown")
+        gene = data.get("gene", "Unknown")
+        variant = data.get("variant", "Unknown")
+
+        if not client:
+            return {
+                "risk_summary": "AI not configured",
+                "key_factors": [],
+                "what_it_means": "",
+                "next_steps": "Set GROQ_API_KEY"
+            }
+
         prompt = f"""
-You are a clinical AI assistant.
+You are a pharmacogenomics expert.
 
-Patient:
-- Age: {input_data['age']}
-- Condition: {input_data['condition']}
-- Drug: {input_drug}
-- Past reaction: {input_data['past_reaction']}
+Drug: {drug}
+Gene: {gene}
+Variant: {variant}
 
-Prediction:
-- Risk: {risk}
-- Confidence: {round(confidence,2)}
-
-Explain clearly for patient.
+Explain clearly.
 
 Return ONLY JSON:
 
@@ -148,73 +243,19 @@ Return ONLY JSON:
         content = response.choices[0].message.content
 
         try:
-            ai_data = json.loads(content)
+            return json.loads(content)
         except:
             match = re.search(r"\{.*\}", content, re.DOTALL)
             if match:
-                ai_data = json.loads(match.group())
+                return json.loads(match.group())
             else:
-                ai_data = {
+                return {
                     "risk_summary": content,
                     "key_factors": [],
                     "what_it_means": "",
-                    "next_steps": "Consult a doctor."
+                    "next_steps": "Consult a clinician"
                 }
 
-        return {
-            "risk": risk,
-            "confidence": round(confidence, 2),
-            "confidence_label": confidence_label,
-            "risk_summary": ai_data.get("risk_summary", ""),
-            "key_factors": ai_data.get("key_factors", []),
-            "what_it_means": ai_data.get("what_it_means", ""),
-            "next_steps": ai_data.get("next_steps", ""),
-            "mapped_drug": mapped_drug
-        }
-
     except Exception as e:
-        return {"error": str(e)}
-
-
-# =====================================
-# 🧠 AI INSIGHTS (FIXED)
-# =====================================
-@app.post("/ai-insights")
-def ai_insights(data: dict):
-    try:
-        prompt = f"""
-You are a friendly medical assistant.
-
-Patient:
-- Age: {data.get('age')}
-- Condition: {data.get('condition')}
-- Medicine: {data.get('drug')}
-- Past reaction: {data.get('past_reaction')}
-
-Explain clearly.
-
-Return JSON:
-
-{{
-  "risk_summary": "...",
-  "key_factors": ["...", "..."],
-  "what_it_means": "...",
-  "next_steps": "..."
-}}
-"""
-
-        response = client.chat.completions.create(
-            model="llama-3.1-8b-instant",
-            messages=[{"role": "user", "content": prompt}],
-            temperature=0.5,
-        )
-
-        content = response.choices[0].message.content
-
-        try:
-            return json.loads(content)
-        except:
-            return {"risk_summary": content}
-
-    except Exception as e:
+        print("❌ ERROR in /ai-insights:", e)
         return {"error": str(e)}
